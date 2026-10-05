@@ -116,6 +116,18 @@ class TimelineClient:
             payload["version_no"] = version_no
         return self._call("POST", "/coverage/audit", payload)
 
+    # 回放裁剪
+    def clip_segments(self, start_ms: int, end_ms: int,
+                      version_no: int | None = None):
+        """回放裁剪：按 UTC 半开窗口 [start_ms, end_ms) 裁出可交给录音设备
+        回放的片段——每条与窗口相交且可定位的声段返回本地裁剪起止与映射
+        UTC 起止。省略 version_no 查询当前时间轴，指定则只使用该版本
+        发布时冻结的锚点与声段。"""
+        payload = {"start_ms": start_ms, "end_ms": end_ms}
+        if version_no is not None:
+            payload["version_no"] = version_no
+        return self._call("POST", "/segments/clip", payload)
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -254,6 +266,21 @@ def main() -> None:
          *cli.coverage_audit(0, 1000, 0))
     show("版本不存在（404 version_not_found）",
          *cli.coverage_audit(0, 1000, 1, version_no=999))
+
+    # 13. 回放裁剪：按 UTC 半开窗口裁出可交给录音设备回放的片段
+    #     每条与窗口相交且可定位的声段返回本地裁剪起止与映射 UTC 起止；
+    #     本地边界取"映射 UTC 首次不小于窗口边界"的整数毫秒，不存在则截在
+    #     声段末端；裁后起止相同的不返回；同设备重叠声段分别返回
+    show("回放裁剪：当前时间轴",
+         *cli.clip_segments(1699999997000, 1700000062000))
+    #     指定 version_no：只使用发布时冻结的锚点与声段，后续变更不影响
+    show("回放裁剪：历史版本 v1（冻结快照）",
+         *cli.clip_segments(1699999997000, 1700000062000, version_no=1))
+    #     无效输入：起点不小于终点 / 版本不存在 -> 拒绝且不改数据
+    show("起点不小于终点（400 invalid_range）",
+         *cli.clip_segments(2000, 1000))
+    show("版本不存在（404 version_not_found）",
+         *cli.clip_segments(0, 1000, version_no=999))
 
 
 if __name__ == "__main__":

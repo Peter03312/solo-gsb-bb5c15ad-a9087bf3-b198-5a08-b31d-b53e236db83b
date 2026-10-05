@@ -58,6 +58,7 @@ def h_root(ctx, body, query):
             "DELETE /devices/{device_id}/anchors/{local_ms} # 锚点更正（删除单个，默认 default 周期）",
             "POST   /segments                                      # body 可带 cycle_id，省略=default",
             "POST   /segments/reassign-cycle           # 批量纠正声段周期归属（整批原子）",
+            "POST   /segments/clip                     # 回放裁剪：按 UTC 半开窗口裁出可回放片段",
             "GET    /segments                                      # 可加 ?device_id=&cycle_id=",
             "GET    /segments/{capture_id}",
             "DELETE /segments/{capture_id}",
@@ -154,6 +155,10 @@ def h_coverage_audit(ctx, body, query):
     return service.coverage_audit(ctx.db_path, body)
 
 
+def h_clip_segments(ctx, body, query):
+    return service.clip_segments(ctx.db_path, body)
+
+
 def h_publish(ctx, body, query):
     return service.publish_version(ctx.db_path, body)
 
@@ -185,6 +190,7 @@ ROUTES = [
     ("DELETE", r"^/devices/(?P<device_id>[^/]+)/anchors/(?P<local_ms>[^/]+)$", h_delete_anchor),
     ("POST", r"^/segments$", h_submit_segment),
     ("POST", r"^/segments/reassign-cycle$", h_reassign_segment_cycles),
+    ("POST", r"^/segments/clip$", h_clip_segments),
     ("GET", r"^/segments$", h_list_segments),
     ("GET", r"^/segments/(?P<capture_id>[^/]+)$", h_get_segment),
     ("DELETE", r"^/segments/(?P<capture_id>[^/]+)$", h_delete_segment),

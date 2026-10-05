@@ -346,3 +346,91 @@ def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
             "located_segment_count": contributing,
             "fragments": maximal,
             "gaps": gaps}
+
+
+# ---------------------------------------------------------------- 回放裁剪
+
+def _first_local_ms_with_utc_geq(locals_list: list[int], utcs_list: list[int],
+                                 lo: int, hi: int, threshold: int) -> int | None:
+    """在整数本地毫秒 [lo, hi] 上找第一个映射 UTC 不小于 threshold 的时刻。
+
+    可定位声段的本地范围落在锚点覆盖内，映射 UTC 在该范围上单调不减
+    （线性漂移 + 毫秒四舍五入保持单调），因此可二分；范围内全部小于
+    threshold 时返回 None。
+    """
+    found = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        u = map_local_to_utc(locals_list, utcs_list, mid)
+        if u is not None and u >= threshold:
+            found = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return found
+
+
+def clip_segment_to_window(anchors_pair, local_start_ms: int, local_end_ms: int,
+                           window_start_ms: int, window_end_ms: int):
+    """计算单条声段在 UTC 半开窗口 [window_start_ms, window_end_ms) 内的本地裁剪。
+
+    - 声段须可定位（起止都在所属周期锚点覆盖内）且与窗口相交
+      （utc_start < window_end 且 utc_end > window_start，边界相接不算相交），
+      否则返回 None；
+    - 两个本地边界分别取该声段本地范围内"映射 UTC 首次不小于窗口对应边界"
+      的整数毫秒；不存在（声段末端映射仍小于窗口边界）则截在声段末端；
+    - 裁后起止相同（无可回放内容）返回 None；
+    - 返回 (local_clip_start, local_clip_end, utc_clip_start, utc_clip_end)，
+      其中 UTC 起止为裁剪后本地边界按同一映射（线性漂移 + 毫秒四舍五入）的结果。
+    """
+    locals_list, utcs_list = anchors_pair
+    utc_start = map_local_to_utc(locals_list, utcs_list, local_start_ms)
+    utc_end = map_local_to_utc(locals_list, utcs_list, local_end_ms)
+    if utc_start is None or utc_end is None:
+        return None  # 不可定位：起止任一时刻超出锚点覆盖
+    if utc_start >= window_end_ms or utc_end <= window_start_ms:
+        return None  # 与窗口不相交（半开语义）
+    clip_start = _first_local_ms_with_utc_geq(
+        locals_list, utcs_list, local_start_ms, local_end_ms, window_start_ms)
+    if clip_start is None:
+        clip_start = local_end_ms  # 不存在 -> 截在声段末端
+    clip_end = _first_local_ms_with_utc_geq(
+        locals_list, utcs_list, local_start_ms, local_end_ms, window_end_ms)
+    if clip_end is None:
+        clip_end = local_end_ms  # 不存在 -> 截在声段末端
+    if clip_start >= clip_end:
+        return None  # 裁后起止相同，不返回
+    return (clip_start, clip_end,
+            map_local_to_utc(locals_list, utcs_list, clip_start),
+            map_local_to_utc(locals_list, utcs_list, clip_end))
+
+
+def compute_clips(segments: list[dict], anchors_map: dict,
+                  window_start_ms: int, window_end_ms: int) -> list[dict]:
+    """回放裁剪纯逻辑：裁出每条与窗口相交且可定位声段的可回放片段。
+
+    - segments：至少含 capture_id / device_id / cycle_id / local_start_ms /
+      local_end_ms（当前时间轴的实时投影或版本冻结快照均可）；
+    - anchors_map：(device_id, cycle_id) -> (locals_list, utcs_list)，
+      声段只使用所属周期的锚点做线性漂移映射（含现有毫秒四舍五入规则）；
+    - 同设备重叠声段分别返回（不做任何合并）；
+    - 结果按 (UTC 起点, 设备编号, 采集编号) 升序。
+    """
+    clips = []
+    for seg in segments:
+        pair = anchors_map.get((seg["device_id"], seg["cycle_id"]), ([], []))
+        clip = clip_segment_to_window(pair, seg["local_start_ms"],
+                                      seg["local_end_ms"],
+                                      window_start_ms, window_end_ms)
+        if clip is None:
+            continue
+        local_start, local_end, utc_start, utc_end = clip
+        clips.append({"capture_id": seg["capture_id"],
+                      "device_id": seg["device_id"],
+                      "cycle_id": seg["cycle_id"],
+                      "local_start_ms": local_start,
+                      "local_end_ms": local_end,
+                      "utc_start_ms": utc_start,
+                      "utc_end_ms": utc_end})
+    clips.sort(key=lambda c: (c["utc_start_ms"], c["device_id"], c["capture_id"]))
+    return clips

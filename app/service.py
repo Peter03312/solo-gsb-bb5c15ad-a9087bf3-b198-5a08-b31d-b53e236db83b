@@ -25,8 +25,8 @@ from datetime import datetime, timezone
 
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
-                    STATUS_UNLOCATABLE, compute_changes, compute_coverage,
-                    cycle_fingerprint, project_segment,
+                    STATUS_UNLOCATABLE, compute_changes, compute_clips,
+                    compute_coverage, cycle_fingerprint, project_segment,
                     require_fields, require_payload, segment_content_hash,
                     sort_projections, validate_cycle_id, validate_fingerprint,
                     validate_id, validate_min_devices, validate_ms,
@@ -105,13 +105,26 @@ def _anchors_of(conn, device_id: str, cycle_id: str | None = None) -> list[dict]
     return [dict(r) for r in rows]
 
 
-def _anchors_map(conn) -> dict:
-    """(device_id, cycle_id) -> (locals_list, utcs_list)，按本地时间升序。"""
+def _anchors_map(conn, version_no: int | None = None) -> dict:
+    """(device_id, cycle_id) -> (locals_list, utcs_list)，按本地时间升序。
+
+    version_no 为 None 时读取当前锚点表；否则读取该版本发布时冻结的锚点
+    （version_anchors）。旧版快照（format_rev=1）的 cycle_id 为 NULL，
+    周期归属一律按 default 处理。
+    """
     m: dict[tuple[str, str], tuple[list[int], list[int]]] = {}
-    for r in conn.execute(
+    if version_no is None:
+        rows = conn.execute(
             "SELECT device_id, cycle_id, local_ms, utc_ms "
-            "FROM anchors ORDER BY device_id, cycle_id, local_ms"):
-        pair = m.setdefault((r["device_id"], r["cycle_id"]), ([], []))
+            "FROM anchors ORDER BY device_id, cycle_id, local_ms")
+    else:
+        rows = conn.execute(
+            "SELECT device_id, cycle_id, local_ms, utc_ms "
+            "FROM version_anchors WHERE version_no=? "
+            "ORDER BY device_id, cycle_id, local_ms", (version_no,))
+    for r in rows:
+        pair = m.setdefault(
+            (r["device_id"], r["cycle_id"] or DEFAULT_CYCLE_ID), ([], []))
         pair[0].append(r["local_ms"])
         pair[1].append(r["utc_ms"])
     return m
@@ -871,6 +884,72 @@ def coverage_audit(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "min_devices": min_devices, **result}
+
+
+# ---------------------------------------------------------------- 回放裁剪
+
+def clip_segments(db_path: str, body):
+    """回放裁剪：按 UTC 半开窗口裁出可交给录音设备回放的片段。
+
+    - 请求体 {start_ms, end_ms, version_no?}：裁剪半开窗口
+      [start_ms, end_ms)；省略 version_no（或为 null）查询当前时间轴
+      （按现有锚点实时映射），指定则只使用该版本发布时冻结的锚点与声段
+      （旧版快照缺失的周期归属按 default 处理）；
+    - 返回每条与窗口相交且可定位声段的本地裁剪起止与映射 UTC 起止：
+      两个本地边界分别取该声段本地范围内"映射 UTC 首次不小于窗口对应
+      边界"的整数毫秒，不存在则截在声段末端；裁后起止相同的声段不返回；
+      同设备重叠声段分别返回，按 (UTC 起点, 设备编号, 采集编号) 排序；
+    - 本接口只读：无效输入或版本不存在即明确拒绝，任何情况下都不改动数据。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["start_ms", "end_ms"])
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"查询窗口起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开窗口 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int) \
+                or version_no < 1:
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号），"
+                           "省略或 null 表示查询当前时间轴",
+                           {"value": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        if version_no is None:
+            # 当前时间轴：读事务内一致快照，按现有锚点实时映射
+            segments = [_row_to_segment(r) for r in conn.execute(
+                "SELECT * FROM segments ORDER BY capture_id")]
+            anchors = _anchors_map(conn)
+            source = "current"
+        else:
+            v = conn.execute(
+                "SELECT version_no FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            # 只使用发布时冻结的锚点与声段；旧版快照（format_rev=1）周期列
+            # 为 NULL，周期归属按 default 处理
+            segments = [{"capture_id": r["capture_id"],
+                         "device_id": r["device_id"],
+                         "cycle_id": r["cycle_id"] or DEFAULT_CYCLE_ID,
+                         "local_start_ms": r["local_start_ms"],
+                         "local_end_ms": r["local_end_ms"]}
+                        for r in conn.execute(
+                            "SELECT capture_id, device_id, cycle_id, "
+                            "local_start_ms, local_end_ms FROM version_segments "
+                            "WHERE version_no=? ORDER BY capture_id",
+                            (version_no,))]
+            anchors = _anchors_map(conn, version_no)
+            source = "version"
+    clips = compute_clips(segments, anchors, start_ms, end_ms)
+    return 200, {"source": source, "version_no": version_no,
+                 "start_ms": start_ms, "end_ms": end_ms,
+                 "segments": clips, "segment_count": len(clips)}
 
 
 # ---------------------------------------------------------------- 版本发布
