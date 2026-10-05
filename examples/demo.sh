@@ -227,3 +227,32 @@ curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
   -d '{"start_ms":0,"end_ms":1000,"min_devices":0}' | pp
 curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
   -d '{"start_ms":0,"end_ms":1000,"min_devices":1,"version_no":999}' | pp
+
+# ----------------------------------------------------------------------
+# 回放片段裁剪（playback clips）：按 UTC 半开窗口裁出可交给录音设备回放的片段
+# ----------------------------------------------------------------------
+
+echo; echo "== 回放裁剪：当前时间轴（UTC 窗口 -> 每条相交可定位声段的本地/UTC 裁剪起止）=="
+echo "-- 只计可定位声段；同设备重叠分别返回；按 (UTC 起点, 设备编号, 采集编号) 排序 --"
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1699999998000,"end_ms":1700000010000}' | pp
+
+echo; echo "== 回放裁剪：只取声段尾部（窗口起点晚于声段起点时，本地起点按映射边界搜索）=="
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1700000015000,"end_ms":1700000060000}' | pp
+
+echo; echo "== 回放裁剪：窗口越过声段 -> 终点截在声段末端；不可定位/相接的声段不返回 =="
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1700000060000,"end_ms":1700000090000}' | pp
+
+echo; echo "== 回放裁剪：指定已发布版本（本地边界按冻结锚点映射，后续变更不影响历史结果）=="
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1699999998000,"end_ms":1700000010000,"version_no":1}' | pp
+
+echo; echo "== 非法裁剪请求：起点不小于终点 / 时间非整数 / 版本不存在（均拒绝且不改数据）=="
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":2000,"end_ms":1000}' | pp
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":"1000","end_ms":2000}' | pp
+curl -s -X POST "$BASE/playback/clips" -H 'Content-Type: application/json' \
+  -d '{"start_ms":0,"end_ms":1000,"version_no":999}' | pp

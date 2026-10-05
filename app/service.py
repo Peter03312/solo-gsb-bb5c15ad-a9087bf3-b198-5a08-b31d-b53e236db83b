@@ -25,12 +25,12 @@ from datetime import datetime, timezone
 
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
-                    STATUS_UNLOCATABLE, compute_changes, compute_coverage,
-                    cycle_fingerprint, project_segment,
-                    require_fields, require_payload, segment_content_hash,
-                    sort_projections, validate_cycle_id, validate_fingerprint,
-                    validate_id, validate_min_devices, validate_ms,
-                    validate_note)
+                    STATUS_UNLOCATABLE, clip_located_segment,
+                    compute_changes, compute_coverage, cycle_fingerprint,
+                    project_segment, require_fields, require_payload,
+                    segment_content_hash, sort_clips, sort_projections,
+                    validate_cycle_id, validate_fingerprint, validate_id,
+                    validate_min_devices, validate_ms, validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -871,6 +871,95 @@ def coverage_audit(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "min_devices": min_devices, **result}
+
+
+# ---------------------------------------------------------------- 回放片段裁剪
+
+def playback_clips(db_path: str, body):
+    """回放片段裁剪：按 UTC 半开窗口裁出可交给录音设备回放的声段片段。
+
+    - 请求体 {start_ms, end_ms, version_no?}：回放窗口为半开区间
+      [start_ms, end_ms)；省略 version_no（或为 null）查询当前时间轴，
+      指定 version_no 只使用该版本发布时冻结的锚点与声段；
+    - 只处理可定位声段：当前视图按现有锚点实时投影；历史版本只依据冻结
+      投影（status=located 的 version_segments），边界按发布时冻结的同周期
+      锚点线性映射，后续锚点更正/声段增删/周期纠正/新发布都不改动历史结果；
+    - 旧版快照（format_rev=1）缺失的周期归属一律按 default 处理；
+    - 每条与窗口相交的声段返回 capture_id、device_id、cycle_id、本地裁剪
+      起止与其映射后的 UTC 起止；同设备重叠声段分别返回；裁剪后本地起止
+      相同的声段不返回；按 (UTC 起点, 设备编号, 采集编号) 升序排序；
+    - 本接口只读：无效输入或版本不存在即明确拒绝，任何情况下都不改动数据；
+      已发布版本查询格式（GET /versions/{n}）保持不变。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["start_ms", "end_ms"])
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"回放窗口起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开区间 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int) \
+                or version_no < 1:
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号），"
+                           "省略或 null 表示查询当前时间轴",
+                           {"value": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        if version_no is None:
+            # 当前时间轴：读事务内一致快照，按现有锚点实时投影
+            rows = conn.execute("SELECT * FROM segments ORDER BY capture_id").fetchall()
+            anchors = _anchors_map(conn)
+            projs = [project_segment(
+                _row_to_segment(r),
+                anchors.get((r["device_id"], r["cycle_id"]), ([], [])))
+                for r in rows]
+            pair_of = {p["capture_id"]:
+                       anchors.get((p["device_id"], p["cycle_id"]), ([], []))
+                       for p in projs}
+            source = "current"
+        else:
+            v = conn.execute(
+                "SELECT version_no FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            # 发布时冻结的锚点（按周期）；旧版快照周期归属缺失 -> default
+            frozen: dict = {}
+            for r in conn.execute(
+                    "SELECT device_id, cycle_id, local_ms, utc_ms "
+                    "FROM version_anchors WHERE version_no=? "
+                    "ORDER BY device_id, cycle_id, local_ms",
+                    (version_no,)):
+                key = (r["device_id"], r["cycle_id"] or DEFAULT_CYCLE_ID)
+                pair = frozen.setdefault(key, ([], []))
+                pair[0].append(r["local_ms"])
+                pair[1].append(r["utc_ms"])
+            projs = [_version_row_to_proj(r) for r in conn.execute(
+                "SELECT * FROM version_segments WHERE version_no=?",
+                (version_no,))]
+            for p in projs:
+                p["cycle_id"] = p["cycle_id"] or DEFAULT_CYCLE_ID
+            pair_of = {p["capture_id"]:
+                       frozen.get((p["device_id"], p["cycle_id"]), ([], []))
+                       for p in projs}
+            source = "version"
+        clips = []
+        for p in projs:
+            if p["status"] != STATUS_LOCATED:
+                continue
+            clip = clip_located_segment(p, pair_of[p["capture_id"]],
+                                        start_ms, end_ms)
+            if clip is not None:
+                clips.append(clip)
+    clips = sort_clips(clips)
+    return 200, {"source": source, "version_no": version_no,
+                 "start_ms": start_ms, "end_ms": end_ms,
+                 "clips": clips, "clip_count": len(clips)}
 
 
 # ---------------------------------------------------------------- 版本发布

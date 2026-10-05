@@ -116,6 +116,23 @@ class TimelineClient:
             payload["version_no"] = version_no
         return self._call("POST", "/coverage/audit", payload)
 
+    # 回放片段裁剪
+    def playback_clips(self, start_ms: int, end_ms: int,
+                       version_no: int | None = None):
+        """回放裁剪：按 UTC 半开窗口 [start_ms, end_ms) 裁出可交给录音设备
+        回放的声段片段。返回每条相交可定位声段的 capture_id、device_id、
+        cycle_id、本地裁剪起止（clip_local_start/end_ms）与映射后的 UTC 起止
+        （clip_utc_start/end_ms），按 (UTC 起点, 设备编号, 采集编号) 排序；
+        同设备重叠声段分别返回，裁后起止相同的不返回。
+
+        省略 version_no 查询当前时间轴；指定则只使用该版本发布时冻结的锚点
+        与声段（旧版快照缺失的周期归属按 default 处理）。只读接口。
+        """
+        payload = {"start_ms": start_ms, "end_ms": end_ms}
+        if version_no is not None:
+            payload["version_no"] = version_no
+        return self._call("POST", "/playback/clips", payload)
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -254,6 +271,31 @@ def main() -> None:
          *cli.coverage_audit(0, 1000, 0))
     show("版本不存在（404 version_not_found）",
          *cli.coverage_audit(0, 1000, 1, version_no=999))
+
+    # 13. 回放片段裁剪：按 UTC 半开窗口裁出可交给录音设备回放的片段
+    #     只处理可定位声段；本地边界取声段范围内映射 UTC 首次不小于窗口
+    #     边界的整数毫秒（终点不存在 -> 截声段末端）；同设备重叠分别返回；
+    #     按 (UTC 起点, 设备编号, 采集编号) 排序；裁后起止相同不返回
+    show("回放裁剪：当前时间轴",
+         *cli.playback_clips(1699999998000, 1700000010000))
+    #     窗口越过声段末端：clip_local_end_ms 截在声段末端
+    show("回放裁剪：窗口越过声段（截末端）",
+         *cli.playback_clips(1700000015000, 1700000060000))
+    #     窗口起点=声段终点（半开相接：CAP-0001 更正后终点为 1700000019408，
+    #     之后到 1700010004033 之间无任何声段）-> 无片段
+    show("回放裁剪：仅边界相接（无片段）",
+         *cli.playback_clips(1700000019408, 1700000020000))
+    #     指定已发布版本：本地边界按发布时冻结的锚点线性映射，
+    #     之后的锚点更正/声段增删/周期纠正/新发布都不改动历史结果
+    show("回放裁剪：历史版本 v1（冻结快照）",
+         *cli.playback_clips(1699999998000, 1700000010000, version_no=1))
+    #     无效输入：起点不小于终点 / 时间非整数 / 版本不存在 -> 拒绝且不改数据
+    show("起点不小于终点（400 invalid_range）",
+         *cli.playback_clips(2000, 1000))
+    show("时间非整数（400 invalid_time）",
+         *cli.playback_clips("1000", 2000))
+    show("版本不存在（404 version_not_found）",
+         *cli.playback_clips(0, 1000, version_no=999))
 
 
 if __name__ == "__main__":

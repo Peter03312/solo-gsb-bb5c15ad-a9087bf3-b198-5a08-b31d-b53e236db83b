@@ -63,6 +63,7 @@ def h_root(ctx, body, query):
             "DELETE /segments/{capture_id}",
             "GET    /timeline/current",
             "POST   /coverage/audit                # 覆盖审计：区间内是否始终有足够设备在录音",
+            "POST   /playback/clips                # 回放裁剪：按 UTC 窗口裁出可回放的声段片段",
             "POST   /versions",
             "GET    /versions",
             "GET    /versions/{version_no}",
@@ -154,6 +155,10 @@ def h_coverage_audit(ctx, body, query):
     return service.coverage_audit(ctx.db_path, body)
 
 
+def h_playback_clips(ctx, body, query):
+    return service.playback_clips(ctx.db_path, body)
+
+
 def h_publish(ctx, body, query):
     return service.publish_version(ctx.db_path, body)
 
@@ -190,6 +195,7 @@ ROUTES = [
     ("DELETE", r"^/segments/(?P<capture_id>[^/]+)$", h_delete_segment),
     ("GET", r"^/timeline/current$", h_current_timeline),
     ("POST", r"^/coverage/audit$", h_coverage_audit),
+    ("POST", r"^/playback/clips$", h_playback_clips),
     ("POST", r"^/versions$", h_publish),
     ("GET", r"^/versions$", h_list_versions),
     ("GET", r"^/versions/(?P<version_no>[^/]+)$", h_get_version),

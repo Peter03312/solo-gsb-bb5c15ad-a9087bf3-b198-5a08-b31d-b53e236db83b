@@ -346,3 +346,67 @@ def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
             "located_segment_count": contributing,
             "fragments": maximal,
             "gaps": gaps}
+
+
+# ---------------------------------------------------------------- 回放片段裁剪
+
+def first_local_at_or_above(locals_list: list[int], utcs_list: list[int],
+                            lo: int, hi: int, target_utc: int) -> int | None:
+    """在本地整数毫秒 [lo, hi] 内，取映射 UTC（四舍五入）首次不小于
+    target_utc 的最小整数毫秒；区间内不存在这样的整数毫秒则返回 None。
+
+    锚点 UTC 严格递增（斜率非负），相邻锚点间的线性映射非降，四舍五入后的
+    整数序列同样非降，因此可用二分查找。调用方须保证 lo、hi 均在锚点覆盖
+    范围 [首锚点, 末锚点] 内（即可映射）。
+    """
+    if map_local_to_utc(locals_list, utcs_list, hi) < target_utc:
+        return None
+    if map_local_to_utc(locals_list, utcs_list, lo) >= target_utc:
+        return lo
+    a, b = lo, hi
+    while a < b:
+        mid = (a + b) // 2
+        if map_local_to_utc(locals_list, utcs_list, mid) >= target_utc:
+            b = mid
+        else:
+            a = mid + 1
+    return a
+
+
+def clip_located_segment(proj: dict, anchors_pair,
+                         win_start: int, win_end: int) -> dict | None:
+    """按 UTC 半开窗口 [win_start, win_end) 裁剪单条可定位声段。
+
+    - proj：可定位声段投影（含本地起止与已映射的 utc_start_ms/utc_end_ms）；
+    - 两个本地边界分别取该声段本地范围内、映射 UTC 首次不小于窗口对应边界
+      的整数毫秒；终点边界在声段本地范围内不存在时截在声段末端；
+    - 起点边界在声段本地范围内不存在（声段整体位于窗口之前），或两个边界
+      落在同一整数毫秒（声段整体位于窗口之后、仅边界相接、零长度声段，或
+      整数毫秒分辨率下窗口内没有任何独立本地帧）时返回 None；
+    - 裁剪后 UTC 起止沿用同一周期锚点的线性漂移与毫秒四舍五入规则，按本地
+      边界重新映射（设备整数毫秒分辨率可能使结果略超出窗口边界，如实返回）。
+    """
+    locals_list, utcs_list = anchors_pair
+    ls, le = proj["local_start_ms"], proj["local_end_ms"]
+    t_start = first_local_at_or_above(locals_list, utcs_list, ls, le, win_start)
+    if t_start is None:
+        return None  # 声段末端映射仍小于窗口起点：声段整体位于窗口之前
+    t_end = first_local_at_or_above(locals_list, utcs_list, ls, le, win_end)
+    if t_end is None:
+        t_end = le  # 声段末端之前始终映射不到窗口终点 -> 截在声段末端
+    if t_start >= t_end:
+        return None  # 裁剪后起止相同（相接/越界/平台/零长度）-> 不返回
+    return {"capture_id": proj["capture_id"],
+            "device_id": proj["device_id"],
+            "cycle_id": proj["cycle_id"],
+            "clip_local_start_ms": t_start,
+            "clip_local_end_ms": t_end,
+            "clip_utc_start_ms": map_local_to_utc(locals_list, utcs_list, t_start),
+            "clip_utc_end_ms": map_local_to_utc(locals_list, utcs_list, t_end)}
+
+
+def sort_clips(clips: list[dict]) -> list[dict]:
+    """回放片段排序：按 (映射后 UTC 起点, 设备编号, 采集编号) 升序稳定排序。"""
+    return sorted(clips,
+                  key=lambda c: (c["clip_utc_start_ms"],
+                                 c["device_id"], c["capture_id"]))
